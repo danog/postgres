@@ -77,9 +77,11 @@ final class PgSqlHandle extends AbstractHandle
         $deferred = &$this->pendingOperation;
         $listeners = &$this->listeners;
         $onClose = new DeferredFuture();
+        $results = [];
 
         $poll = EventLoop::onReadable($socket, static function (string $watcher) use (
             &$deferred,
+            &$results,
             &$lastUsedAt,
             &$listeners,
             &$connection,
@@ -118,15 +120,32 @@ final class PgSqlHandle extends AbstractHandle
                     return; // No active query, only notification listeners.
                 }
 
-                if (\pg_connection_busy($connection)) {
+                // Collect every result of the operation before completing it: the operation only ends once
+                // the connection is idle again. Otherwise, another operation could be sent in between, and
+                // fetching the remaining results of this one would block on and consume its results instead.
+                $operation = $deferred;
+                while (!\pg_connection_busy($connection)) {
+                    $result = \pg_get_result($connection);
+                    if ($result !== false) {
+                        $results[] = $result;
+                        $status = \pg_result_status($result);
+                        if ($status !== \PGSQL_COPY_IN && $status !== \PGSQL_COPY_OUT) {
+                            continue;
+                        }
+                        // COPY is not supported, the result is an error and closes the connection.
+                    }
+
+                    $operationResults = $results;
+                    $results = [];
+
+                    $deferred = null;
+                    $operation->complete($operationResults);
+
+                    if (empty($listeners)) {
+                        EventLoop::unreference($watcher);
+                    }
+
                     return;
-                }
-
-                $deferred->complete(\pg_get_result($connection));
-                $deferred = null;
-
-                if (empty($listeners)) {
-                    EventLoop::unreference($watcher);
                 }
             } catch (SqlConnectionException $exception) {
                 $connection = null; // Marks connection as dead.
@@ -209,7 +228,7 @@ final class PgSqlHandle extends AbstractHandle
 
         EventLoop::queue(function () use ($queryDeferred, $typesDeferred): void {
             try {
-                $result = $queryDeferred->getFuture()->await();
+                [$result] = $queryDeferred->getFuture()->await();
                 if (\pg_result_status($result) !== \PGSQL_TUPLES_OK) {
                     throw new SqlException(\pg_result_error($result) ?: 'Unknown result error');
                 }
@@ -265,9 +284,11 @@ final class PgSqlHandle extends AbstractHandle
      * @param \Closure $function Function to execute.
      * @param mixed ...$args Arguments to pass to function.
      *
+     * @return non-empty-list<\PgSql\Result> All results of the operation.
+     *
      * @throws SqlException
      */
-    private function send(\Closure $function, mixed ...$args): mixed
+    private function send(\Closure $function, mixed ...$args): array
     {
         $this->types ??= $this->fetchTypes()->await();
 
@@ -305,17 +326,19 @@ final class PgSqlHandle extends AbstractHandle
     }
 
     /**
-     * @param \PgSql\Result $result PostgreSQL result resource.
+     * @param non-empty-list<\PgSql\Result> $results All results of the operation.
      * @param string $sql Query SQL.
      *
      * @throws SqlException
      * @throws SqlQueryError
      */
-    private function createResult(\PgSql\Result $result, string $sql): PostgresResult
+    private function createResult(array $results, string $sql): PostgresResult
     {
         if ($this->handle === null) {
             throw new \Error("The connection to the database has been closed");
         }
+
+        $result = \array_shift($results);
 
         \assert($this->types !== null, 'Expected type array to be populated before creating a result');
 
@@ -326,11 +349,15 @@ final class PgSqlHandle extends AbstractHandle
             case \PGSQL_COMMAND_OK:
                 return new PostgresCommandResult(
                     \pg_affected_rows($result),
-                    Future::complete($this->fetchNextResult($sql)),
+                    Future::complete($results ? $this->createResult($results, $sql) : null),
                 );
 
             case \PGSQL_TUPLES_OK:
-                return new PgSqlResultSet($result, $this->types, Future::complete($this->fetchNextResult($sql)));
+                return new PgSqlResultSet(
+                    $result,
+                    $this->types,
+                    Future::complete($results ? $this->createResult($results, $sql) : null),
+                );
 
             case \PGSQL_NONFATAL_ERROR:
             case \PGSQL_FATAL_ERROR:
@@ -338,16 +365,7 @@ final class PgSqlHandle extends AbstractHandle
                 foreach (self::DIAGNOSTIC_CODES as $fieldCode => $description) {
                     $diagnostics[$description] = \pg_result_error_field($result, $fieldCode);
                 }
-                $message = \pg_result_error($result) ?: 'Unknown result error';
-                \set_error_handler(self::getErrorHandler());
-                try {
-                    while (\pg_connection_busy($this->handle) && \pg_get_result($this->handle)) {
-                        // Clear all outstanding result rows from the connection
-                    }
-                } finally {
-                    \restore_error_handler();
-                    throw new PostgresQueryError($message, $diagnostics, $sql);
-                }
+                throw new PostgresQueryError(\pg_result_error($result) ?: 'Unknown result error', $diagnostics, $sql);
 
             case \PGSQL_BAD_RESPONSE:
                 $this->close();
@@ -363,22 +381,6 @@ final class PgSqlHandle extends AbstractHandle
                 ));
                 // @codeCoverageIgnoreEnd
         }
-    }
-
-    /**
-     * @throws SqlException
-     */
-    private function fetchNextResult(string $sql): ?PostgresResult
-    {
-        if ($this->handle === null) {
-            throw new \Error("The connection to the database has been closed");
-        }
-
-        if ($result = \pg_get_result($this->handle)) {
-            return $this->createResult($result, $sql);
-        }
-
-        return null;
     }
 
     #[\Override]
@@ -482,7 +484,7 @@ final class PgSqlHandle extends AbstractHandle
         }
 
         $future = async(function () use ($name, $modifiedSql, $sql): string {
-            $result = $this->send(\pg_send_prepare(...), $name, $modifiedSql);
+            [$result] = $this->send(\pg_send_prepare(...), $name, $modifiedSql);
 
             switch ($status = \pg_result_status($result)) {
                 case \PGSQL_COMMAND_OK:
